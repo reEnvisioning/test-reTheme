@@ -22,8 +22,7 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
             install_repo(&root_dir()?, &repo).map_err(|e| e.to_string())
         }
         _ => Err(
-            "usage: retheme list | retheme switch <name> | retheme install <github-owner/repo>"
-                .into(),
+            "usage: retheme list | retheme switch <name> | retheme install <repository-url>".into(),
         ),
     }
 }
@@ -67,8 +66,7 @@ fn discover_themes(root: &Path) -> io::Result<Vec<String>> {
 }
 
 fn install_repo(root: &Path, repo: &str) -> io::Result<()> {
-    let (owner, name) = parse_github_repo(repo)?;
-    let url = format!("https://github.com/{owner}/{name}.git");
+    let name = repo_name_from_url(repo)?;
     let tmp = env::temp_dir().join(format!(
         "retheme-install-{}-{}",
         std::process::id(),
@@ -76,7 +74,7 @@ fn install_repo(root: &Path, repo: &str) -> io::Result<()> {
     ));
 
     let status = Command::new("git")
-        .args(["clone", "--depth", "1", &url])
+        .args(["clone", "--depth", "1", "--", repo])
         .arg(&tmp)
         .status()?;
     if !status.success() {
@@ -152,34 +150,70 @@ fn copy_dir(src: &Path, dest: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn parse_github_repo(repo: &str) -> io::Result<(String, String)> {
-    let repo = repo
-        .strip_prefix("https://github.com/")
-        .or_else(|| repo.strip_prefix("github.com/"))
-        .unwrap_or(repo)
-        .trim_end_matches('/')
-        .trim_end_matches(".git");
-    let mut parts = repo.split('/');
-    let (Some(owner), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
+fn repo_name_from_url(repo: &str) -> io::Result<String> {
+    let path = if let Some((scheme, rest)) = repo.split_once("://") {
+        if !scheme
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic())
+            || !scheme
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+            || rest.is_empty()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected complete repository URL",
+            ));
+        }
+        if scheme.eq_ignore_ascii_case("file") {
+            rest.strip_prefix('/').filter(|path| !path.is_empty())
+        } else {
+            rest.split_once('/')
+                .and_then(|(host, path)| (!host.is_empty() && !path.is_empty()).then_some(path))
+        }
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected complete repository URL",
+            )
+        })?
+    } else if let Some((host, path)) = repo.split_once(':') {
+        let host = host.rsplit_once('@').map_or(host, |(_, host)| host);
+        if matches!(
+            host.to_ascii_lowercase().as_str(),
+            "http" | "https" | "ssh" | "git" | "file"
+        ) || host.is_empty()
+            || host.contains('@')
+            || host.contains('/')
+            || path.is_empty()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected complete repository URL",
+            ));
+        }
+        path
+    } else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "expected GitHub repo as owner/repo",
+            "expected complete repository URL",
         ));
     };
-    if valid_github_part(owner) && valid_github_part(name) {
-        Ok((owner.to_string(), name.to_string()))
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "GitHub owner/repo contains invalid characters",
-        ))
-    }
-}
-
-fn valid_github_part(s: &str) -> bool {
-    !s.is_empty()
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    let component = path
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("");
+    let name = component
+        .strip_suffix(".git")
+        .unwrap_or(component)
+        .to_string();
+    validate_name(&name)?;
+    Ok(name)
 }
 
 fn unique_id() -> u128 {
@@ -489,17 +523,24 @@ hello
     }
 
     #[test]
-    fn parses_github_repo_names() {
-        assert_eq!(
-            parse_github_repo("reEnvisioning/themes").unwrap(),
-            ("reEnvisioning".into(), "themes".into())
-        );
-        assert_eq!(
-            parse_github_repo("https://github.com/reEnvisioning/themes.git").unwrap(),
-            ("reEnvisioning".into(), "themes".into())
-        );
-        assert!(parse_github_repo("https://example.com/a/b").is_err());
-        assert!(parse_github_repo("owner/../repo").is_err());
+    fn derives_theme_name_from_complete_repository_urls() {
+        for (url, name) in [
+            ("https://github.com/reEnvisioning/themes.git", "themes"),
+            ("https://gitlab.com/owner/repo.git", "repo"),
+            ("git@gitlab.com:owner/repo.git", "repo"),
+            ("gitlab.com:owner/repo.git", "repo"),
+            ("host:owner/repo.git", "repo"),
+            ("ssh://git@example.com/owner/repo.git", "repo"),
+            ("git://example.com/owner/repo.git", "repo"),
+            ("file:///tmp/repo.git", "repo"),
+            ("https://example.com/owner/repo.git?ref=main", "repo"),
+        ] {
+            assert_eq!(repo_name_from_url(url).unwrap(), name, "{url}");
+        }
+        assert!(repo_name_from_url("owner/repo").is_err());
+        assert!(repo_name_from_url("https:repo").is_err());
+        assert!(repo_name_from_url("https://example.com/").is_err());
+        assert!(repo_name_from_url("https://example.com/owner/..").is_err());
     }
 
     #[test]
