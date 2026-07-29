@@ -1,6 +1,7 @@
 use std::{
     env, fs, io,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 fn main() {
@@ -17,7 +18,13 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
             switch_theme(&root_dir()?, &name).map_err(|e| e.to_string())
         }
         (Some("list"), None, None) => list_themes(&root_dir()?).map_err(|e| e.to_string()),
-        _ => Err("usage: retheme switch <name> | retheme list".into()),
+        (Some("install"), Some(repo), None) => {
+            install_repo(&root_dir()?, &repo).map_err(|e| e.to_string())
+        }
+        _ => Err(
+            "usage: retheme list | retheme switch <name> | retheme install <github-owner/repo>"
+                .into(),
+        ),
     }
 }
 
@@ -57,6 +64,127 @@ fn discover_themes(root: &Path) -> io::Result<Vec<String>> {
     }
     names.sort();
     Ok(names)
+}
+
+fn install_repo(root: &Path, repo: &str) -> io::Result<()> {
+    let (owner, name) = parse_github_repo(repo)?;
+    let url = format!("https://github.com/{owner}/{name}.git");
+    let tmp = env::temp_dir().join(format!(
+        "retheme-install-{}-{}",
+        std::process::id(),
+        unique_id()
+    ));
+
+    let status = Command::new("git")
+        .args(["clone", "--depth", "1", &url])
+        .arg(&tmp)
+        .status()?;
+    if !status.success() {
+        let _ = fs::remove_dir_all(&tmp);
+        return Err(io::Error::other("git clone failed"));
+    }
+
+    let result = install_from_dir(root, &tmp, &name);
+    let _ = fs::remove_dir_all(&tmp);
+    result
+}
+
+fn install_from_dir(root: &Path, source: &Path, fallback_name: &str) -> io::Result<()> {
+    let themes = root.join("themes");
+    fs::create_dir_all(&themes)?;
+
+    let mut installed = Vec::new();
+    if source.join("theme.json").is_file() {
+        validate_name(fallback_name)?;
+        copy_theme_dir(source, &themes.join(fallback_name))?;
+        installed.push(fallback_name.to_string());
+    } else {
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if entry.file_type()?.is_dir() && entry.path().join("theme.json").is_file() {
+                validate_name(name)?;
+                copy_theme_dir(&entry.path(), &themes.join(name))?;
+                installed.push(name.to_string());
+            }
+        }
+    }
+
+    if installed.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "repository contains no theme.json files",
+        ));
+    }
+    installed.sort();
+    println!("installed {}", installed.join(", "));
+    Ok(())
+}
+
+fn copy_theme_dir(src: &Path, dest: &Path) -> io::Result<()> {
+    if dest.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("theme already exists: {}", dest.display()),
+        ));
+    }
+    copy_dir(src, dest)
+}
+
+fn copy_dir(src: &Path, dest: &Path) -> io::Result<()> {
+    fs::create_dir_all(dest)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        if entry.file_name() == ".git" {
+            continue;
+        }
+        let ty = entry.file_type()?;
+        let target = dest.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir(&entry.path(), &target)?;
+        } else if ty.is_file() {
+            fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_github_repo(repo: &str) -> io::Result<(String, String)> {
+    let repo = repo
+        .strip_prefix("https://github.com/")
+        .or_else(|| repo.strip_prefix("github.com/"))
+        .unwrap_or(repo)
+        .trim_end_matches('/')
+        .trim_end_matches(".git");
+    let mut parts = repo.split('/');
+    let (Some(owner), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected GitHub repo as owner/repo",
+        ));
+    };
+    if valid_github_part(owner) && valid_github_part(name) {
+        Ok((owner.to_string(), name.to_string()))
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "GitHub owner/repo contains invalid characters",
+        ))
+    }
+}
+
+fn valid_github_part(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+fn unique_id() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
 }
 
 fn switch_theme(root: &Path, name: &str) -> io::Result<()> {
@@ -336,6 +464,40 @@ hello
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn installs_theme_repository_layout() {
+        let root = temp_root();
+        let source = temp_root();
+        add_theme(&source, "sakura", b"sakura", "app.toml", b"app");
+        add_theme(&source, "horror", b"horror", "app.toml", b"app");
+
+        install_from_dir(&root, &source.join("themes"), "ignored").unwrap();
+
+        assert_eq!(discover_themes(&root).unwrap(), ["horror", "sakura"]);
+        assert_eq!(
+            fs::read(root.join("themes/sakura/theme.json")).unwrap(),
+            b"sakura"
+        );
+        assert!(install_from_dir(&root, &source.join("themes"), "ignored").is_err());
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(source);
+    }
+
+    #[test]
+    fn parses_github_repo_names() {
+        assert_eq!(
+            parse_github_repo("reEnvisioning/themes").unwrap(),
+            ("reEnvisioning".into(), "themes".into())
+        );
+        assert_eq!(
+            parse_github_repo("https://github.com/reEnvisioning/themes.git").unwrap(),
+            ("reEnvisioning".into(), "themes".into())
+        );
+        assert!(parse_github_repo("https://example.com/a/b").is_err());
+        assert!(parse_github_repo("owner/../repo").is_err());
     }
 
     #[test]

@@ -3,6 +3,7 @@
 Minimal reEnvisioning theme switcher.
 
 ```sh
+retheme install reEnvisioning/themes
 retheme list
 retheme switch sakura
 ```
