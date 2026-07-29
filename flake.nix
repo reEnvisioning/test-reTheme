@@ -12,6 +12,10 @@
         version = "0.1.0";
         src = ./.;
         cargoLock.lockFile = ./Cargo.lock;
+        nativeBuildInputs = [ pkgs.makeWrapper ];
+        postInstall = ''
+          wrapProgram $out/bin/retheme --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.git ]}
+        '';
       };
     in {
       packages.${system} = {

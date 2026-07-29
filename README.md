@@ -8,6 +8,8 @@ retheme list
 retheme switch sakura
 ```
 
+Only install themes you trust. Theme metadata can write user config files declared by the theme when you switch to it.
+
 ## NixOS flake import
 
 After the repository is published, add reTheme as an input:

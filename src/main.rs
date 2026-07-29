@@ -93,11 +93,10 @@ fn install_from_dir(root: &Path, source: &Path, fallback_name: &str) -> io::Resu
     let themes = root.join("themes");
     fs::create_dir_all(&themes)?;
 
-    let mut installed = Vec::new();
+    let mut found = Vec::new();
     if source.join("theme.json").is_file() {
         validate_name(fallback_name)?;
-        copy_theme_dir(source, &themes.join(fallback_name))?;
-        installed.push(fallback_name.to_string());
+        found.push((source.to_path_buf(), fallback_name.to_string()));
     } else {
         for entry in fs::read_dir(source)? {
             let entry = entry?;
@@ -105,31 +104,34 @@ fn install_from_dir(root: &Path, source: &Path, fallback_name: &str) -> io::Resu
             let Some(name) = name.to_str() else { continue };
             if entry.file_type()?.is_dir() && entry.path().join("theme.json").is_file() {
                 validate_name(name)?;
-                copy_theme_dir(&entry.path(), &themes.join(name))?;
-                installed.push(name.to_string());
+                found.push((entry.path(), name.to_string()));
             }
         }
     }
 
-    if installed.is_empty() {
+    if found.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "repository contains no theme.json files",
         ));
     }
+    for (_, name) in &found {
+        let dest = themes.join(name);
+        if dest.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("theme already exists: {}", dest.display()),
+            ));
+        }
+    }
+    let mut installed = Vec::new();
+    for (src, name) in found {
+        copy_dir(&src, &themes.join(&name))?;
+        installed.push(name);
+    }
     installed.sort();
     println!("installed {}", installed.join(", "));
     Ok(())
-}
-
-fn copy_theme_dir(src: &Path, dest: &Path) -> io::Result<()> {
-    if dest.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!("theme already exists: {}", dest.display()),
-        ));
-    }
-    copy_dir(src, dest)
 }
 
 fn copy_dir(src: &Path, dest: &Path) -> io::Result<()> {
