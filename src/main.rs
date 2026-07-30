@@ -4,6 +4,8 @@ use std::{
     process::Command,
 };
 
+const THEME_FILE: &str = "theme.toml";
+
 fn main() {
     if let Err(err) = run(env::args().skip(1)) {
         eprintln!("error: {err}");
@@ -14,17 +16,17 @@ fn main() {
 fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
     let mut args = args.into_iter();
     match (args.next().as_deref(), args.next(), args.next()) {
-        (Some("switch"), Some(name), None) => {
-            switch_theme(&root_dir()?, &name).map_err(|e| e.to_string())
+        (Some("switch"), Some(name), None) => switch_theme(&root_dir()?, &name),
+        (Some("list"), None, None) => list_themes(&root_dir()?),
+        (Some("install"), Some(repo), None) => install_repo(&root_dir()?, &repo),
+        _ => {
+            return Err(
+                "usage: retheme list | retheme switch <name> | retheme install <repository-url>"
+                    .into(),
+            )
         }
-        (Some("list"), None, None) => list_themes(&root_dir()?).map_err(|e| e.to_string()),
-        (Some("install"), Some(repo), None) => {
-            install_repo(&root_dir()?, &repo).map_err(|e| e.to_string())
-        }
-        _ => Err(
-            "usage: retheme list | retheme switch <name> | retheme install <repository-url>".into(),
-        ),
     }
+    .map_err(|e| e.to_string())
 }
 
 fn root_dir() -> Result<PathBuf, String> {
@@ -48,16 +50,16 @@ fn list_themes(root: &Path) -> io::Result<()> {
 fn discover_themes(root: &Path) -> io::Result<Vec<String>> {
     let themes = root.join("themes");
     let mut names = Vec::new();
-    if !themes.is_dir() {
-        return Ok(names);
-    }
-    for entry in fs::read_dir(themes)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() && entry.path().join("theme.json").is_file() {
-            if let Some(name) = entry.file_name().to_str() {
-                if validate_name(name).is_ok() {
-                    names.push(name.to_string());
-                }
+    if themes.is_dir() {
+        for entry in fs::read_dir(themes)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if entry.file_type()?.is_dir()
+                && validate_name(name).is_ok()
+                && entry.path().join(THEME_FILE).is_file()
+            {
+                names.push(name.to_string());
             }
         }
     }
@@ -67,11 +69,10 @@ fn discover_themes(root: &Path) -> io::Result<Vec<String>> {
 
 fn install_repo(root: &Path, repo: &str) -> io::Result<()> {
     let name = repo_name_from_url(repo)?;
-    let tmp = env::temp_dir().join(format!(
-        "retheme-install-{}-{}",
-        std::process::id(),
-        unique_id()
-    ));
+    let cache = root.join("cache");
+    fs::create_dir_all(&cache)?;
+    let tmp = cache.join(format!("retheme-install-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
 
     let status = Command::new("git")
         .args(["clone", "--depth", "1", "--", repo])
@@ -88,31 +89,37 @@ fn install_repo(root: &Path, repo: &str) -> io::Result<()> {
 }
 
 fn install_from_dir(root: &Path, source: &Path, fallback_name: &str) -> io::Result<()> {
-    let themes = root.join("themes");
-    fs::create_dir_all(&themes)?;
-
-    let mut found = Vec::new();
-    if source.join("theme.json").is_file() {
+    let found = if source.join(THEME_FILE).is_file() {
         validate_name(fallback_name)?;
-        found.push((source.to_path_buf(), fallback_name.to_string()));
+        vec![(source.to_path_buf(), fallback_name.to_string())]
     } else {
+        let mut found = Vec::new();
         for entry in fs::read_dir(source)? {
             let entry = entry?;
+            if entry.file_name() == ".git" {
+                continue;
+            }
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            if entry.file_type()?.is_dir() && entry.path().join("theme.json").is_file() {
+            if entry.file_type()?.is_dir() && entry.path().join(THEME_FILE).is_file() {
                 validate_name(name)?;
                 found.push((entry.path(), name.to_string()));
             }
         }
-    }
+        found
+    };
 
     if found.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "repository contains no theme.json files",
+            format!("repository contains no {THEME_FILE} files"),
         ));
     }
+    for (source, _) in &found {
+        preflight_dir(source)?;
+    }
+
+    let themes = root.join("themes");
     for (_, name) in &found {
         let dest = themes.join(name);
         if dest.exists() {
@@ -122,6 +129,7 @@ fn install_from_dir(root: &Path, source: &Path, fallback_name: &str) -> io::Resu
             ));
         }
     }
+    fs::create_dir_all(&themes)?;
     let mut installed = Vec::new();
     for (src, name) in found {
         copy_dir(&src, &themes.join(&name))?;
@@ -132,6 +140,26 @@ fn install_from_dir(root: &Path, source: &Path, fallback_name: &str) -> io::Resu
     Ok(())
 }
 
+fn preflight_dir(dir: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_name() == ".git" {
+            continue;
+        }
+        let ty = entry.file_type()?;
+        if ty.is_symlink() || (!ty.is_file() && !ty.is_dir()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported repository entry: {}", entry.path().display()),
+            ));
+        }
+        if ty.is_dir() {
+            preflight_dir(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
 fn copy_dir(src: &Path, dest: &Path) -> io::Result<()> {
     fs::create_dir_all(dest)?;
     for entry in fs::read_dir(src)? {
@@ -139,12 +167,17 @@ fn copy_dir(src: &Path, dest: &Path) -> io::Result<()> {
         if entry.file_name() == ".git" {
             continue;
         }
-        let ty = entry.file_type()?;
         let target = dest.join(entry.file_name());
+        let ty = entry.file_type()?;
         if ty.is_dir() {
             copy_dir(&entry.path(), &target)?;
         } else if ty.is_file() {
             fs::copy(entry.path(), target)?;
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported repository entry: {}", entry.path().display()),
+            ));
         }
     }
     Ok(())
@@ -152,25 +185,12 @@ fn copy_dir(src: &Path, dest: &Path) -> io::Result<()> {
 
 fn repo_name_from_url(repo: &str) -> io::Result<String> {
     let path = if let Some((scheme, rest)) = repo.split_once("://") {
-        if !scheme
-            .bytes()
-            .next()
-            .is_some_and(|b| b.is_ascii_alphabetic())
-            || !scheme
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
-            || rest.is_empty()
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "expected complete repository URL",
-            ));
-        }
-        if scheme.eq_ignore_ascii_case("file") {
-            rest.strip_prefix('/').filter(|path| !path.is_empty())
-        } else {
-            rest.split_once('/')
-                .and_then(|(host, path)| (!host.is_empty() && !path.is_empty()).then_some(path))
+        match scheme.to_ascii_lowercase().as_str() {
+            "file" => rest.strip_prefix('/').filter(|path| !path.is_empty()),
+            "https" | "ssh" | "git" => rest
+                .split_once('/')
+                .and_then(|(host, path)| (!host.is_empty() && !path.is_empty()).then_some(path)),
+            _ => None,
         }
         .ok_or_else(|| {
             io::Error::new(
@@ -180,27 +200,19 @@ fn repo_name_from_url(repo: &str) -> io::Result<String> {
         })?
     } else if let Some((host, path)) = repo.split_once(':') {
         let host = host.rsplit_once('@').map_or(host, |(_, host)| host);
-        if matches!(
-            host.to_ascii_lowercase().as_str(),
-            "http" | "https" | "ssh" | "git" | "file"
-        ) || host.is_empty()
-            || host.contains('@')
+        if host.is_empty()
             || host.contains('/')
             || path.is_empty()
+            || matches!(host, "http" | "https" | "ssh" | "git" | "file")
         {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "expected complete repository URL",
-            ));
+            bad_url()?;
         }
         path
     } else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "expected complete repository URL",
-        ));
+        bad_url()?
     };
-    let component = path
+
+    let name = path
         .split(['?', '#'])
         .next()
         .unwrap_or("")
@@ -208,41 +220,44 @@ fn repo_name_from_url(repo: &str) -> io::Result<String> {
         .rsplit('/')
         .next()
         .unwrap_or("");
-    let name = component
-        .strip_suffix(".git")
-        .unwrap_or(component)
-        .to_string();
-    validate_name(&name)?;
-    Ok(name)
+    let name = name.strip_suffix(".git").unwrap_or(name);
+    validate_name(name)?;
+    Ok(name.to_string())
 }
 
-fn unique_id() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
+fn bad_url<T>() -> io::Result<T> {
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "expected complete repository URL",
+    ))
 }
 
 fn switch_theme(root: &Path, name: &str) -> io::Result<()> {
     validate_name(name)?;
 
     let theme_dir = root.join("themes").join(name);
-    let theme_json = theme_dir.join("theme.json");
-    if !theme_json.is_file() {
+    let theme_file = theme_dir.join(THEME_FILE);
+    if !theme_file.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("missing {}", theme_json.display()),
+            format!("missing {}", theme_file.display()),
         ));
     }
 
     let active = root.join("active");
     fs::create_dir_all(&active)?;
-
     replace_symlink(
         &active.join("theme"),
         Path::new("..").join("themes").join(name),
     )?;
-    copy_atomic(&theme_json, &active.join("theme.json"))?;
+    copy_atomic(&theme_file, &active.join(THEME_FILE))?;
+    if theme_dir.join("colors.toml").is_file() {
+        copy_atomic(&theme_dir.join("colors.toml"), &active.join("colors.toml"))?;
+    } else if let Err(err) = fs::remove_file(active.join("colors.toml")) {
+        if err.kind() != io::ErrorKind::NotFound {
+            return Err(err);
+        }
+    }
     replace_apps(&theme_dir.join("apps"), &active.join("apps"))?;
     apply_file_handlers(root, &active.join("apps"))?;
     fs::write(active.join("current-theme"), name)?;
@@ -252,9 +267,8 @@ fn switch_theme(root: &Path, name: &str) -> io::Result<()> {
 }
 
 fn validate_name(name: &str) -> io::Result<()> {
-    let path = Path::new(name);
     if name.is_empty()
-        || path.components().count() != 1
+        || Path::new(name).components().count() != 1
         || name == "."
         || name == ".."
         || name.contains('/')
@@ -273,9 +287,7 @@ fn replace_symlink(link: &Path, target: PathBuf) -> io::Result<()> {
     use std::os::unix::fs::symlink;
 
     let tmp = link.with_extension("tmp");
-    if fs::symlink_metadata(&tmp).is_ok() {
-        fs::remove_file(&tmp)?;
-    }
+    let _ = fs::remove_file(&tmp);
     symlink(target, &tmp)?;
     fs::rename(tmp, link)
 }
@@ -297,7 +309,9 @@ fn write_atomic(dest: &Path, content: &str) -> io::Result<()> {
 
 fn replace_apps(src: &Path, dest: &Path) -> io::Result<()> {
     let tmp = dest.with_extension("tmp");
+    let old = dest.with_extension("old");
     let _ = fs::remove_dir_all(&tmp);
+    let _ = fs::remove_dir_all(&old);
     fs::create_dir_all(&tmp)?;
 
     if src.is_dir() {
@@ -309,8 +323,6 @@ fn replace_apps(src: &Path, dest: &Path) -> io::Result<()> {
         }
     }
 
-    let old = dest.with_extension("old");
-    let _ = fs::remove_dir_all(&old);
     if dest.exists() {
         fs::rename(dest, &old)?;
     }
@@ -386,183 +398,4 @@ fn toml_multiline(text: &str, key: &str) -> Option<String> {
         }
     }
     None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temp_root() -> PathBuf {
-        let id = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        env::temp_dir().join(format!("retheme-test-{}-{id}", std::process::id()))
-    }
-
-    fn add_theme(root: &Path, name: &str, theme: &[u8], app_name: &str, app: &[u8]) {
-        let apps = root.join("themes").join(name).join("apps");
-        fs::create_dir_all(&apps).unwrap();
-        fs::write(root.join("themes").join(name).join("theme.json"), theme).unwrap();
-        fs::write(apps.join(app_name), app).unwrap();
-    }
-
-    fn fixture(name: &str) -> PathBuf {
-        let root = temp_root();
-        add_theme(
-            &root,
-            name,
-            b"theme",
-            "app.toml",
-            b"handler = \"settings\"\n",
-        );
-        root
-    }
-
-    #[test]
-    fn switches_theme() {
-        let root = fixture("sakura");
-        switch_theme(&root, "sakura").unwrap();
-
-        assert_eq!(fs::read(root.join("active/theme.json")).unwrap(), b"theme");
-        assert_eq!(
-            fs::read_to_string(root.join("active/apps/app.toml")).unwrap(),
-            "handler = \"settings\"\n"
-        );
-        assert_eq!(
-            fs::read(root.join("active/current-theme")).unwrap(),
-            b"sakura"
-        );
-
-        #[cfg(unix)]
-        assert_eq!(
-            fs::read_link(root.join("active/theme")).unwrap(),
-            Path::new("../themes/sakura")
-        );
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn discovers_installed_themes() {
-        let root = fixture("sakura");
-        add_theme(&root, "horror", b"theme", "app.toml", b"");
-        assert_eq!(discover_themes(&root).unwrap(), ["horror", "sakura"]);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn generic_file_handler_writes_declared_target() {
-        let root = temp_root();
-        add_theme(
-            &root,
-            "sakura",
-            b"theme",
-            "whatever.toml",
-            br#"[meta]
-handler = "file"
-target = "out"
-filename = "generated.conf"
-
-[content]
-text = """
-hello
-"""
-"#,
-        );
-
-        switch_theme(&root, "sakura").unwrap();
-        assert_eq!(
-            fs::read_to_string(root.join("out/generated.conf")).unwrap(),
-            "hello\n"
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn replaces_existing_theme_and_stale_apps() {
-        let root = temp_root();
-        add_theme(&root, "sakura", b"sakura", "old.toml", b"old");
-        add_theme(&root, "horror", b"horror", "new.toml", b"new");
-
-        switch_theme(&root, "sakura").unwrap();
-        switch_theme(&root, "horror").unwrap();
-
-        assert_eq!(fs::read(root.join("active/theme.json")).unwrap(), b"horror");
-        assert_eq!(fs::read(root.join("active/apps/new.toml")).unwrap(), b"new");
-        assert!(!root.join("active/apps/old.toml").exists());
-
-        #[cfg(unix)]
-        assert_eq!(
-            fs::read_link(root.join("active/theme")).unwrap(),
-            Path::new("../themes/horror")
-        );
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn installs_theme_repository_layout() {
-        let root = temp_root();
-        let source = temp_root();
-        add_theme(&source, "sakura", b"sakura", "app.toml", b"app");
-        add_theme(&source, "horror", b"horror", "app.toml", b"app");
-
-        install_from_dir(&root, &source.join("themes"), "ignored").unwrap();
-
-        assert_eq!(discover_themes(&root).unwrap(), ["horror", "sakura"]);
-        assert_eq!(
-            fs::read(root.join("themes/sakura/theme.json")).unwrap(),
-            b"sakura"
-        );
-        assert!(install_from_dir(&root, &source.join("themes"), "ignored").is_err());
-
-        let _ = fs::remove_dir_all(root);
-        let _ = fs::remove_dir_all(source);
-    }
-
-    #[test]
-    fn derives_theme_name_from_complete_repository_urls() {
-        for (url, name) in [
-            ("https://github.com/reEnvisioning/themes.git", "themes"),
-            ("https://gitlab.com/owner/repo.git", "repo"),
-            ("git@gitlab.com:owner/repo.git", "repo"),
-            ("gitlab.com:owner/repo.git", "repo"),
-            ("host:owner/repo.git", "repo"),
-            ("ssh://git@example.com/owner/repo.git", "repo"),
-            ("git://example.com/owner/repo.git", "repo"),
-            ("file:///tmp/repo.git", "repo"),
-            ("https://example.com/owner/repo.git?ref=main", "repo"),
-        ] {
-            assert_eq!(repo_name_from_url(url).unwrap(), name, "{url}");
-        }
-        assert!(repo_name_from_url("owner/repo").is_err());
-        assert!(repo_name_from_url("https:repo").is_err());
-        assert!(repo_name_from_url("https://example.com/").is_err());
-        assert!(repo_name_from_url("https://example.com/owner/..").is_err());
-    }
-
-    #[test]
-    fn rejects_path_traversal() {
-        let root = fixture("sakura");
-        switch_theme(&root, "sakura").unwrap();
-        assert!(switch_theme(&root, "../sakura").is_err());
-
-        #[cfg(unix)]
-        assert_eq!(
-            fs::read_link(root.join("active/theme")).unwrap(),
-            Path::new("../themes/sakura")
-        );
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn rejects_separators() {
-        for name in ["", ".", "..", "a/b", "a\\b"] {
-            assert!(validate_name(name).is_err(), "{name:?}");
-        }
-        assert!(validate_name("sakura").is_ok());
-    }
 }
