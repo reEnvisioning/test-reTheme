@@ -227,7 +227,17 @@ fn switch_theme(root: &Path, name: &str) -> io::Result<()> {
             format!("missing {}", theme_file.display()),
         ));
     }
-    let colors = parse_base16(&fs::read_to_string(&base16_file)?)?;
+    let colors_text = fs::read_to_string(&base16_file).map_err(|err| {
+        if err.kind() == io::ErrorKind::NotFound {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("theme '{name}' is missing {BASE16_FILE}"),
+            )
+        } else {
+            err
+        }
+    })?;
+    let colors = parse_base16(&colors_text)?;
     let dark = theme_mode(&fs::read_to_string(&theme_file)?) == "dark";
     let active = root.join("active");
     fs::create_dir_all(&active)?;
