@@ -119,7 +119,7 @@ extern "C" {
 fn switch_command(root: &Path, name: &str) -> io::Result<()> {
     renderers::validate_wallpaper_backend()?;
     let prepared = prepare_switch(root, name)?;
-    core::validate_active(root)?;
+    core::validate_active_for_switch(root)?;
     let wallpaper = prepared.wallpaper_state.clone().map(|state| state.1);
     let colors = prepared.colors.clone();
     let dark = prepared.metadata.dark;
@@ -210,22 +210,7 @@ fn install_repo(root: &Path, repo: &str) -> io::Result<()> {
             "{error}; clone cleanup failed: {cleanup}"
         ))),
         (Ok(_), Ok(())) => Ok(()),
-        (Ok(installed), Err(error)) => {
-            let mut rollback = Vec::new();
-            for name in installed {
-                if let Err(restore) = remove_path(&root.join("themes").join(name)) {
-                    rollback.push(restore.to_string());
-                }
-            }
-            if rollback.is_empty() {
-                Err(error)
-            } else {
-                Err(io::Error::other(format!(
-                    "clone cleanup failed: {error}; install rollback failed: {}",
-                    rollback.join(", ")
-                )))
-            }
-        }
+        (Ok(_), Err(error)) => Err(error),
     }
 }
 fn install_from_dir(root: &Path, source: &Path, fallback: &str) -> io::Result<Vec<String>> {
@@ -279,19 +264,16 @@ fn install_from_dir(root: &Path, source: &Path, fallback: &str) -> io::Result<Ve
         preflight_dir(source)?;
     }
     let themes = root.join("themes");
-    for (_, name) in &found {
-        if themes.join(name).exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("theme already exists: {}", themes.join(name).display()),
-            ));
-        }
-    }
     fs::create_dir_all(&themes)?;
     let stage = unique_path(&themes, "install")?;
     fs::create_dir(&stage)?;
     let names: Vec<String> = found.iter().map(|(_, name)| name.clone()).collect();
-    let mut installed = Vec::new();
+    let existing: Vec<String> = names
+        .iter()
+        .filter(|name| fs::symlink_metadata(themes.join(name)).is_ok())
+        .cloned()
+        .collect();
+    let mut replaced = Vec::new();
     let result = (|| {
         for (src, name) in found {
             copy_dir(&src, &stage.join(&name))?;
@@ -300,58 +282,73 @@ fn install_from_dir(root: &Path, source: &Path, fallback: &str) -> io::Result<Ve
             core::validate_staged_pack(&stage.join(name), name)?;
         }
         for name in &names {
-            rename_noreplace(&stage.join(name), &themes.join(name))?;
-            installed.push(name.clone());
+            let destination = themes.join(name);
+            let source = stage.join(name);
+            let backup = if fs::symlink_metadata(&destination).is_ok() {
+                let backup = unique_path(&themes, "install-backup")?;
+                rename_exchange(&source, &destination)?;
+                if let Err(error) = fs::rename(&source, &backup) {
+                    let rollback = rename_exchange(&source, &destination);
+                    return Err(match rollback {
+                        Ok(()) => error,
+                        Err(rollback) => io::Error::other(format!(
+                            "updated {name}, but backup failed: {error}; rollback failed: {rollback}"
+                        )),
+                    });
+                }
+                Some(backup)
+            } else {
+                fs::rename(source, destination)?;
+                None
+            };
+            replaced.push((name.clone(), backup));
         }
-        installed.sort();
-        println!("installed {}", installed.join(", "));
-        Ok(installed.clone())
+        Ok(())
     })();
     let cleanup = remove_path(&stage);
-    let installed = match result {
-        Ok(installed) => installed,
-        Err(error) => {
-            let mut rollback_errors = Vec::new();
-            for name in &installed {
-                if let Err(rollback) = remove_path(&themes.join(name)) {
-                    rollback_errors.push(format!("{}: {rollback}", themes.join(name).display()));
+    if let Err(error) = result {
+        let mut rollback_errors = Vec::new();
+        for (name, backup) in replaced.into_iter().rev() {
+            let destination = themes.join(&name);
+            if let Err(rollback) = remove_path(&destination) {
+                rollback_errors.push(format!("{destination:?}: {rollback}"));
+            }
+            if let Some(backup) = backup {
+                if let Err(rollback) = fs::rename(backup, destination) {
+                    rollback_errors.push(format!("{name}: {rollback}"));
                 }
             }
-            return match (rollback_errors.is_empty(), cleanup) {
-                (true, Ok(())) => Err(error),
-                (true, Err(cleanup)) => Err(io::Error::other(format!(
-                    "{error}; install staging cleanup failed: {cleanup}"
-                ))),
-                (false, Ok(())) => Err(io::Error::other(format!(
-                    "{error}; install rollback failed: {}",
-                    rollback_errors.join(", ")
-                ))),
-                (false, Err(cleanup)) => Err(io::Error::other(format!(
-                    "{error}; install rollback failed: {}; staging cleanup failed: {cleanup}",
-                    rollback_errors.join(", ")
-                ))),
-            };
         }
-    };
-    match cleanup {
-        Ok(()) => Ok(installed),
-        Err(error) => {
-            let mut rollback_errors = Vec::new();
-            for name in &installed {
-                if let Err(rollback) = remove_path(&themes.join(name)) {
-                    rollback_errors.push(format!("{}: {rollback}", themes.join(name).display()));
-                }
-            }
-            if rollback_errors.is_empty() {
-                Err(error)
-            } else {
-                Err(io::Error::other(format!(
-                    "install cleanup failed: {error}; rollback failed: {}",
-                    rollback_errors.join(", ")
-                )))
-            }
+        let suffix = if rollback_errors.is_empty() {
+            String::new()
+        } else {
+            format!("; install rollback failed: {}", rollback_errors.join(", "))
+        };
+        return Err(io::Error::other(format!("{error}{suffix}")));
+    }
+    cleanup?;
+    for (_, backup) in replaced {
+        if let Some(backup) = backup {
+            remove_path(&backup)?;
         }
     }
+    let updated: Vec<String> = names
+        .iter()
+        .filter(|name| existing.iter().any(|old| old == *name))
+        .cloned()
+        .collect();
+    let installed: Vec<String> = names
+        .iter()
+        .filter(|name| !existing.iter().any(|old| old == *name))
+        .cloned()
+        .collect();
+    if !installed.is_empty() {
+        println!("installed {}", installed.join(", "));
+    }
+    if !updated.is_empty() {
+        println!("updated {}", updated.join(", "));
+    }
+    Ok(names)
 }
 fn preflight_dir(dir: &Path) -> io::Result<()> {
     for entry in fs::read_dir(dir)? {
@@ -386,7 +383,7 @@ fn unique_path(parent: &Path, kind: &str) -> io::Result<PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
-fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
+fn rename_exchange(source: &Path, destination: &Path) -> io::Result<()> {
     use std::{ffi::CString, os::unix::ffi::OsStrExt};
     unsafe extern "C" {
         fn renameat2(
@@ -401,28 +398,28 @@ fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
         .map_err(|_| io::Error::other("source contains NUL"))?;
     let destination = CString::new(destination.as_os_str().as_bytes())
         .map_err(|_| io::Error::other("destination contains NUL"))?;
-    if unsafe { renameat2(-100, source.as_ptr(), -100, destination.as_ptr(), 1) } == 0 {
+    if unsafe { renameat2(-100, source.as_ptr(), -100, destination.as_ptr(), 2) } == 0 {
         return Ok(());
     }
     let error = io::Error::last_os_error();
     if matches!(error.raw_os_error(), Some(18) | Some(22)) {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "atomic no-replace rename is unavailable",
+            "atomic exchange is unavailable",
         ));
     }
     Err(error)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
-    if fs::symlink_metadata(destination).is_ok() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "destination already exists",
-        ));
+fn rename_exchange(source: &Path, destination: &Path) -> io::Result<()> {
+    let old = destination.with_file_name(format!(".retheme-old-{}", std::process::id()));
+    fs::rename(destination, &old)?;
+    if let Err(error) = fs::rename(source, destination) {
+        let _ = fs::rename(&old, destination);
+        return Err(error);
     }
-    fs::rename(source, destination)
+    fs::rename(old, source)
 }
 
 fn remove_path(path: &Path) -> io::Result<()> {
@@ -515,6 +512,38 @@ mod tests {
             absolute_path("HOME", "/tmp/home".into()).unwrap(),
             PathBuf::from("/tmp/home")
         );
+    }
+
+    #[test]
+    fn install_updates_same_theme_without_touching_unrelated_themes() {
+        let root = env::temp_dir().join(format!("retheme-install-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let source = root.join("source/sakura");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(
+            source.join(THEME_FILE),
+            "schema = 1\nname = \"sakura\"\nmode = \"dark\"\n",
+        )
+        .unwrap();
+        fs::write(
+            source.join(BASE16_FILE),
+            (0..16)
+                .map(|i| format!("base{:02X}: \"#000000\"\n", i))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let existing = root.join("themes/sakura");
+        fs::create_dir_all(&existing).unwrap();
+        fs::write(existing.join(THEME_FILE), "old").unwrap();
+        fs::create_dir_all(root.join("themes/other")).unwrap();
+        fs::write(root.join("themes/other/keep"), "yes").unwrap();
+        install_from_dir(&root, &root.join("source"), "sakura").unwrap();
+        assert!(existing.join(BASE16_FILE).is_file());
+        assert_eq!(
+            fs::read_to_string(root.join("themes/other/keep")).unwrap(),
+            "yes"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(target_os = "linux")]

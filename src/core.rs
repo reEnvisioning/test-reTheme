@@ -728,11 +728,73 @@ pub(crate) fn validate_active(root: &Path) -> io::Result<()> {
     validate_active_tree(root, &root.join("active"))
 }
 
+pub(crate) fn validate_active_for_switch(root: &Path) -> io::Result<()> {
+    if !active_needs_migration(&root.join("active"))? {
+        validate_active(root)?;
+    }
+    Ok(())
+}
+
+const LEGACY_ACTIVE_ENTRIES: [&str; 7] = [
+    THEME_FILE,
+    BASE16_FILE,
+    "colors.toml",
+    "current-theme",
+    "apps",
+    "theme.json",
+    "wallpaper.toml",
+];
+
+fn active_needs_migration(active: &Path) -> io::Result<bool> {
+    let metadata = match fs::symlink_metadata(active) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "active state must be a regular directory",
+        ));
+    }
+    let mut legacy = false;
+    for entry in fs::read_dir(active)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == "theme" {
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if !metadata.file_type().is_symlink() {
+                return Err(invalid_pack("active theme must be a symlink"));
+            }
+            continue;
+        }
+        let known = name
+            .to_str()
+            .is_some_and(|name| LEGACY_ACTIVE_ENTRIES.iter().any(|entry| *entry == name));
+        if !known {
+            return validate_active_tree(active.parent().unwrap_or(Path::new(".")), active)
+                .map(|_| false);
+        }
+        legacy = true;
+    }
+    Ok(legacy)
+}
+
 pub(crate) fn publish_switch(root: &Path, prepared: PreparedTheme) -> io::Result<()> {
     let active = root.join("active");
-    validate_active_tree(root, &active)?;
+    let migrate_legacy = active_needs_migration(&active)?;
+    if !migrate_legacy {
+        validate_active_tree(root, &active)?;
+    }
     let stage = unique_sibling(&active, "stage")?;
     fs::create_dir(&stage)?;
+    let legacy_backup = if migrate_legacy {
+        let cache = root.join("cache");
+        fs::create_dir_all(&cache)?;
+        Some(unique_sibling(&cache.join("legacy-active"), "backup")?)
+    } else {
+        None
+    };
     let mut exchanged = false;
     let result = (|| {
         if let Some(state) = &prepared.wallpaper_state {
@@ -751,6 +813,17 @@ pub(crate) fn publish_switch(root: &Path, prepared: PreparedTheme) -> io::Result
         if had_active {
             atomic_exchange(&stage, &active)?;
             exchanged = true;
+            if let Some(backup) = &legacy_backup {
+                if let Err(error) = fs::rename(&stage, backup) {
+                    return match atomic_exchange(&stage, &active) {
+                        Ok(()) => Err(error),
+                        Err(rollback) => Err(io::Error::other(format!(
+                            "legacy active backup failed: {error}; rollback failed: {rollback}"
+                        ))),
+                    };
+                }
+                return Ok(());
+            }
             if let Err(cleanup) = remove_path(&stage) {
                 return match atomic_exchange(&stage, &active) {
                     Ok(()) => {
@@ -1245,6 +1318,37 @@ mod tests {
             fs::read_link(root.join("active/theme")).unwrap(),
             PathBuf::from("../themes/detailed")
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn switch_migrates_known_legacy_active_projection() {
+        let root = env::temp_dir().join(format!("retheme-legacy-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let theme = root.join("themes/minimal");
+        fs::create_dir_all(&theme).unwrap();
+        fs::write(
+            theme.join(THEME_FILE),
+            "schema = 1\nname = \"minimal\"\nmode = \"dark\"\n",
+        )
+        .unwrap();
+        fs::write(
+            theme.join(BASE16_FILE),
+            (0..16)
+                .map(|i| format!("base{:02X}: \"#000000\"\n", i))
+                .collect::<String>(),
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("active/apps")).unwrap();
+        fs::write(root.join("active/theme.toml"), "legacy").unwrap();
+        fs::write(root.join("active/base16.yaml"), "legacy").unwrap();
+        publish_switch(&root, prepare_switch(&root, "minimal").unwrap()).unwrap();
+        assert_eq!(
+            fs::read_link(root.join("active/theme")).unwrap(),
+            PathBuf::from("../themes/minimal")
+        );
+        assert!(root.join("cache").read_dir().unwrap().next().is_some());
+        assert!(root.join("active/theme.toml").symlink_metadata().is_err());
         let _ = fs::remove_dir_all(root);
     }
 
