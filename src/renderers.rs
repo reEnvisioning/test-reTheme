@@ -744,15 +744,93 @@ mod tests {
     #[test]
     fn wallpaper_backend_names_are_explicit() {
         use std::ffi::OsStr;
+        #[cfg(unix)]
+        use std::os::unix::ffi::OsStrExt;
 
-        assert_eq!(wallpaper_backend_name(None).unwrap(), "rewallpaper");
-        for name in ["rewallpaper", "sway", "hyprpaper", "swww", "none"] {
+        assert_eq!(wallpaper_backend_name(None).unwrap(), "auto");
+        for name in [
+            "auto",
+            "rewallpaper",
+            "sway",
+            "hyprpaper",
+            "swww",
+            "swaybg",
+            "none",
+        ] {
             assert_eq!(
                 wallpaper_backend_name(Some(OsStr::new(name))).unwrap(),
                 name
             );
         }
         assert!(wallpaper_backend_name(Some(OsStr::new("unknown-backend"))).is_err());
+        #[cfg(unix)]
+        assert!(wallpaper_backend_name(Some(std::ffi::OsStr::from_bytes(b"bad\xff"))).is_err());
+        let all = AutoAvailability {
+            rewallpaper: true,
+            sway: true,
+            hyprpaper: true,
+            swww: true,
+            swaybg: true,
+        };
+        assert_eq!(resolve_auto(all), Some(WallpaperBackend::Rewallpaper));
+        assert_eq!(
+            resolve_auto(AutoAvailability {
+                rewallpaper: false,
+                ..all
+            }),
+            Some(WallpaperBackend::Sway)
+        );
+        assert_eq!(
+            resolve_auto(AutoAvailability {
+                rewallpaper: false,
+                sway: false,
+                ..all
+            }),
+            Some(WallpaperBackend::Hyprpaper)
+        );
+        assert_eq!(
+            resolve_auto(AutoAvailability {
+                rewallpaper: false,
+                sway: false,
+                hyprpaper: false,
+                ..all
+            }),
+            Some(WallpaperBackend::Swww)
+        );
+        assert_eq!(
+            resolve_auto(AutoAvailability {
+                rewallpaper: false,
+                sway: false,
+                hyprpaper: false,
+                swww: false,
+                ..all
+            }),
+            Some(WallpaperBackend::Swaybg)
+        );
+        assert_eq!(
+            resolve_auto(AutoAvailability {
+                rewallpaper: false,
+                sway: false,
+                hyprpaper: false,
+                swww: false,
+                swaybg: false
+            }),
+            None
+        );
+        assert_eq!(
+            command_spec(WallpaperBackend::Swaybg, Path::new("/tmp/a b.png")),
+            (
+                "swaybg",
+                vec![
+                    "-i".into(),
+                    "/tmp/a b.png".into(),
+                    "-m".into(),
+                    "fill".into()
+                ]
+            )
+        );
+        assert!(parse_swaybg_state("pid=12\nstart_time=34\n").is_some());
+        assert!(parse_swaybg_state("pid=12\npid=13\nstart_time=34\n").is_none());
     }
 
     #[test]
@@ -824,67 +902,164 @@ fn optional_command<const N: usize>(program: &str, args: [&str; N]) {
     }
 }
 
-pub(crate) fn validate_wallpaper_backend() -> std::io::Result<()> {
-    wallpaper_backend().map(|_| ())
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WallpaperBackend {
+    Rewallpaper,
+    Sway,
+    Hyprpaper,
+    Swww,
+    Swaybg,
+    None,
 }
 
 fn wallpaper_backend() -> std::io::Result<&'static str> {
     wallpaper_backend_name(env::var_os("RETHEME_WALLPAPER_BACKEND").as_deref())
 }
 
+pub(crate) fn validate_wallpaper_backend() -> std::io::Result<()> {
+    wallpaper_backend().map(|_| ())
+}
+
 fn wallpaper_backend_name(value: Option<&std::ffi::OsStr>) -> std::io::Result<&'static str> {
-    let Some(value) = value else {
-        return Ok("rewallpaper");
+    let value = match value {
+        None => "auto",
+        Some(value) => value.to_str().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "RETHEME_WALLPAPER_BACKEND must be valid UTF-8",
+            )
+        })?,
     };
-    match value.to_str() {
-        Some("rewallpaper") => Ok("rewallpaper"),
-        Some("sway") => Ok("sway"),
-        Some("hyprpaper") => Ok("hyprpaper"),
-        Some("swww") => Ok("swww"),
-        Some("none") => Ok("none"),
-        Some(_) => Err(std::io::Error::new(
+    match value {
+        "auto" => Ok("auto"),
+        "rewallpaper" => Ok("rewallpaper"),
+        "sway" => Ok("sway"),
+        "hyprpaper" => Ok("hyprpaper"),
+        "swww" => Ok("swww"),
+        "swaybg" => Ok("swaybg"),
+        "none" => Ok("none"),
+        _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "RETHEME_WALLPAPER_BACKEND must be rewallpaper, sway, hyprpaper, swww, or none",
-        )),
-        None => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "RETHEME_WALLPAPER_BACKEND must be valid UTF-8",
+            "RETHEME_WALLPAPER_BACKEND must be auto, rewallpaper, sway, hyprpaper, swww, swaybg, or none",
         )),
     }
 }
 
-pub(crate) fn apply_wallpaper(path: &Path) -> std::io::Result<()> {
-    let backend = wallpaper_backend()?;
-    if backend == "rewallpaper" && !rewallpaper_available() {
-        return Ok(());
-    }
-    let (program, args): (&str, Vec<String>) = match backend {
-        "rewallpaper" => (
-            "rewallpaper",
-            vec!["apply".into(), path.display().to_string()],
-        ),
-        "sway" => (
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AutoAvailability {
+    rewallpaper: bool,
+    sway: bool,
+    hyprpaper: bool,
+    swww: bool,
+    swaybg: bool,
+}
+
+fn resolve_auto(available: AutoAvailability) -> Option<WallpaperBackend> {
+    [
+        (available.rewallpaper, WallpaperBackend::Rewallpaper),
+        (available.sway, WallpaperBackend::Sway),
+        (available.hyprpaper, WallpaperBackend::Hyprpaper),
+        (available.swww, WallpaperBackend::Swww),
+        (available.swaybg, WallpaperBackend::Swaybg),
+    ]
+    .into_iter()
+    .find_map(|(available, backend)| available.then_some(backend))
+}
+
+fn executable(name: &str) -> bool {
+    let Some(path) = env::var_os("PATH") else {
+        return false;
+    };
+    env::split_paths(&path).any(|dir| {
+        let path = dir.join(name);
+        fs::metadata(path).is_ok_and(|m| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                m.is_file() && m.permissions().mode() & 0o111 != 0
+            }
+            #[cfg(not(unix))]
+            {
+                m.is_file()
+            }
+        })
+    })
+}
+
+fn auto_backend() -> Option<WallpaperBackend> {
+    resolve_auto(AutoAvailability {
+        rewallpaper: rewallpaper_available_quiet(),
+        sway: !env::var_os("SWAYSOCK").is_none_or(|v| v.is_empty()) && executable("swaymsg"),
+        hyprpaper: !env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none_or(|v| v.is_empty())
+            && executable("hyprctl"),
+        swww: executable("swww"),
+        swaybg: !env::var_os("WAYLAND_DISPLAY").is_none_or(|v| v.is_empty())
+            && executable("swaybg"),
+    })
+}
+
+fn command_spec(backend: WallpaperBackend, path: &Path) -> (&'static str, Vec<String>) {
+    let path = path.display().to_string();
+    match backend {
+        WallpaperBackend::Rewallpaper => ("rewallpaper", vec!["apply".into(), path]),
+        WallpaperBackend::Sway => (
             "swaymsg",
             vec![
                 "output".into(),
                 "*".into(),
                 "bg".into(),
-                path.display().to_string(),
+                path,
                 "fill".into(),
             ],
         ),
-        "hyprpaper" => (
+        WallpaperBackend::Hyprpaper => (
             "hyprctl",
             vec![
                 "hyprpaper".into(),
                 "wallpaper".into(),
-                format!(",{},cover", path.display()),
+                format!(",{path},cover"),
             ],
         ),
-        "swww" => ("swww", vec!["img".into(), path.display().to_string()]),
-        "none" => return Ok(()),
+        WallpaperBackend::Swww => ("swww", vec!["img".into(), path]),
+        WallpaperBackend::Swaybg => (
+            "swaybg",
+            vec!["-i".into(), path, "-m".into(), "fill".into()],
+        ),
+        WallpaperBackend::None => unreachable!(),
+    }
+}
+
+pub(crate) fn apply_wallpaper(root: &Path, path: &Path) -> std::io::Result<()> {
+    let configured = wallpaper_backend()?;
+    let backend = match configured {
+        "auto" => auto_backend().unwrap_or_else(|| {
+            eprintln!("warning: no usable wallpaper backend found; skipping wallpaper apply");
+            WallpaperBackend::None
+        }),
+        "rewallpaper" => WallpaperBackend::Rewallpaper,
+        "sway" => WallpaperBackend::Sway,
+        "hyprpaper" => WallpaperBackend::Hyprpaper,
+        "swww" => WallpaperBackend::Swww,
+        "swaybg" => WallpaperBackend::Swaybg,
+        "none" => WallpaperBackend::None,
         _ => unreachable!(),
     };
+    if backend != WallpaperBackend::Swaybg {
+        if let Err(error) = stop_tracked_swaybg(root) {
+            eprintln!("warning: could not stop tracked swaybg: {error}");
+            return Ok(());
+        }
+    }
+    if backend == WallpaperBackend::None {
+        return Ok(());
+    }
+    if backend == WallpaperBackend::Rewallpaper && !rewallpaper_available() {
+        return Ok(());
+    }
+    if backend == WallpaperBackend::Swaybg {
+        return apply_swaybg(root, path);
+    }
+    let (program, args) = command_spec(backend, path);
     match Command::new(program).args(&args).status() {
         Ok(status) if status.success() => {}
         Ok(status) => eprintln!("warning: {program} failed ({status})"),
@@ -904,5 +1079,155 @@ fn rewallpaper_available() -> bool {
             eprintln!("warning: rewallpaper unavailable: {err}; skipping wallpaper apply");
             false
         }
+    }
+}
+
+fn rewallpaper_available_quiet() -> bool {
+    Command::new("rewallpaper")
+        .arg("available")
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn swaybg_pid_path(root: &Path) -> PathBuf {
+    root.join("active/wallpaper.pid")
+}
+
+fn parse_swaybg_state(text: &str) -> Option<(u32, u64)> {
+    let mut pid = None;
+    let mut start = None;
+    for line in text.lines() {
+        let (key, value) = line.split_once('=')?;
+        match key {
+            "pid" if pid.is_none() => pid = Some(value.parse().ok()?),
+            "start_time" if start.is_none() => start = Some(value.parse().ok()?),
+            _ => return None,
+        }
+    }
+    let pid: u32 = pid?;
+    let start: u64 = start?;
+    (pid != 0 && start != 0).then_some((pid, start))
+}
+
+#[cfg(target_os = "linux")]
+fn proc_start_time(pid: u32) -> Option<u64> {
+    let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let end = text.rfind(") ")?;
+    text[end + 2..].split_whitespace().nth(19)?.parse().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn is_owned_swaybg(pid: u32, start_time: u64) -> bool {
+    if proc_start_time(pid) != Some(start_time) {
+        return false;
+    }
+    let executable = fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .and_then(|path| path.file_name().map(|name| name == "swaybg"))
+        .unwrap_or(false);
+    let cmdline = match fs::read(format!("/proc/{pid}/cmdline")) {
+        Ok(cmdline) => cmdline,
+        Err(_) => return false,
+    };
+    let program = cmdline.split(|byte| *byte == 0).next().unwrap_or_default();
+    executable
+        && Path::new(std::str::from_utf8(program).unwrap_or_default())
+            .file_name()
+            .is_some_and(|name| name == "swaybg")
+}
+
+pub(crate) fn stop_tracked_swaybg(root: &Path) -> std::io::Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = root;
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let pid_path = swaybg_pid_path(root);
+        let text = match fs::read_to_string(&pid_path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if let Some((pid, start)) = parse_swaybg_state(&text) {
+            if is_owned_swaybg(pid, start) {
+                let status = Command::new("kill").arg(pid.to_string()).status()?;
+                if !status.success() {
+                    return Err(std::io::Error::other(format!(
+                        "could not stop owned swaybg PID {pid} ({status})"
+                    )));
+                }
+            }
+        }
+        crate::core::remove_path(&pid_path)
+    }
+}
+
+fn apply_swaybg(root: &Path, path: &Path) -> std::io::Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (root, path);
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let pid_path = swaybg_pid_path(root);
+        if let Ok(text) = fs::read_to_string(&pid_path) {
+            if let Some((pid, start)) = parse_swaybg_state(&text) {
+                if is_owned_swaybg(pid, start) {
+                    match Command::new("kill").arg(pid.to_string()).status() {
+                        Ok(status) if status.success() => {}
+                        Ok(status) => {
+                            eprintln!("warning: could not stop owned swaybg PID {pid} ({status}); skipping replacement");
+                            return Ok(());
+                        }
+                        Err(error) => {
+                            eprintln!("warning: could not stop owned swaybg PID {pid}: {error}; skipping replacement");
+                            return Ok(());
+                        }
+                    }
+                    for _ in 0..100 {
+                        if !is_owned_swaybg(pid, start) {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    if is_owned_swaybg(pid, start) {
+                        eprintln!(
+                            "warning: owned swaybg PID {pid} did not exit; skipping replacement"
+                        );
+                        return Ok(());
+                    }
+                    crate::core::remove_path(&pid_path)?;
+                }
+            }
+        }
+        let (_, args) = command_spec(WallpaperBackend::Swaybg, path);
+        let mut child = match Command::new("swaybg").args(&args).spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                eprintln!("warning: swaybg unavailable: {error}");
+                return Ok(());
+            }
+        };
+        let start = match proc_start_time(child.id()) {
+            Some(start) => start,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                eprintln!("warning: cannot identify spawned swaybg; skipping wallpaper apply");
+                return Ok(());
+            }
+        };
+        if let Err(error) = write_atomic(
+            &pid_path,
+            &format!("pid={}\nstart_time={start}\n", child.id()),
+        ) {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("warning: cannot record swaybg ownership: {error}");
+        }
+        Ok(())
     }
 }

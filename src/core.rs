@@ -738,6 +738,7 @@ pub(crate) fn publish_switch(root: &Path, prepared: PreparedTheme) -> io::Result
         if let Some(state) = &prepared.wallpaper_state {
             publish_wallpaper_state(&stage, state)?;
         }
+        copy_wallpaper_pid(&active, &stage)?;
         replace_symlink(
             &stage.join("theme"),
             Path::new("..").join("themes").join(&prepared.name),
@@ -854,11 +855,59 @@ fn validate_active_tree(root: &Path, active: &Path) -> io::Result<()> {
         })?;
         active_wallpaper_index(active, &theme_dir, name, &pack)?;
     }
+    let pid = match fs::symlink_metadata(active.join("wallpaper.pid")) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    if let Some(metadata) = pid {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(invalid_wallpapers(
+                "active wallpaper PID is not a regular file",
+            ));
+        }
+        let text = fs::read_to_string(active.join("wallpaper.pid"))?;
+        parse_wallpaper_pid(&text)
+            .ok_or_else(|| invalid_wallpapers("malformed active wallpaper PID"))?;
+    }
     for entry in fs::read_dir(active)? {
         let name = entry?.file_name();
-        if name != "theme" && name != "wallpaper.toml" {
+        if name != "theme" && name != "wallpaper.toml" && name != "wallpaper.pid" {
             return Err(invalid_pack("active state contains an unknown entry"));
         }
+    }
+    Ok(())
+}
+
+fn parse_wallpaper_pid(text: &str) -> Option<(u32, u64)> {
+    let mut pid = None;
+    let mut start = None;
+    for line in text.lines() {
+        let (key, value) = line.split_once('=')?;
+        match key {
+            "pid" if pid.is_none() => pid = Some(value.parse().ok()?),
+            "start_time" if start.is_none() => start = Some(value.parse().ok()?),
+            _ => return None,
+        }
+    }
+    let pid = pid?;
+    let start = start?;
+    (pid != 0 && start != 0).then_some((pid, start))
+}
+
+fn copy_wallpaper_pid(active: &Path, stage: &Path) -> io::Result<()> {
+    let source = active.join("wallpaper.pid");
+    match fs::symlink_metadata(&source) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(invalid_wallpapers(
+                    "active wallpaper PID is not a regular file",
+                ));
+            }
+            fs::copy(source, stage.join("wallpaper.pid"))?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
     Ok(())
 }
@@ -869,6 +918,7 @@ fn publish_wallpaper_transaction(active: &Path, state: &(String, PathBuf)) -> io
     let mut exchanged = false;
     let result = (|| {
         publish_wallpaper_state(&stage, state)?;
+        copy_wallpaper_pid(active, &stage)?;
         let theme = fs::read_link(active.join("theme"))?;
         replace_symlink(&stage.join("theme"), theme)?;
         atomic_exchange(&stage, active)?;

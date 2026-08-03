@@ -123,10 +123,13 @@ fn switch_command(root: &Path, name: &str) -> io::Result<()> {
     let wallpaper = prepared.wallpaper_state.clone().map(|state| state.1);
     let colors = prepared.colors.clone();
     let dark = prepared.metadata.dark;
+    if wallpaper.is_none() {
+        renderers::stop_tracked_swaybg(root)?;
+    }
     publish_switch(root, prepared)?;
     renderers::render_fixed(root, &colors, dark)?;
     if let Some(path) = wallpaper {
-        renderers::apply_wallpaper(&path)?;
+        renderers::apply_wallpaper(root, &path)?;
     }
     renderers::apply_renderers(dark);
     println!("switched to {name}");
@@ -136,7 +139,7 @@ fn switch_command(root: &Path, name: &str) -> io::Result<()> {
 fn wallpaper_command(root: &Path, argument: &str) -> io::Result<()> {
     renderers::validate_wallpaper_backend()?;
     let path = prepare_wallpaper_command(root, argument)?;
-    renderers::apply_wallpaper(&path)?;
+    renderers::apply_wallpaper(root, &path)?;
     Ok(())
 }
 

@@ -32,12 +32,6 @@ Unknown root entries, symlinks, and special files are rejected. `base16.yaml` mu
 
 Theme files and active state are owned by reTheme. Optional GTK 3/4 (GNOME, Cinnamon, Xfce), Qt5/6 (Plasma), Kitty, btop, Neovim, Firefox, LibreWolf, foot, Alacritty, and Chromium fragments are generated only when their config directories exist. Absent optional parent directories warn and skip; existing wrong-type parents, I/O errors, unsafe symlinked paths, malformed state, and renderer read/write failures are fatal. Chromium receives an unpacked theme at `chromium/retheme-theme/manifest.json`; foot and Alacritty receive fragments and may require one-time native activation/import.
 
-Wallpaper application is an optional stdlib process boundary controlled by `RETHEME_WALLPAPER_BACKEND`:
+Wallpaper application is an optional stdlib process boundary controlled by `RETHEME_WALLPAPER_BACKEND` (unset and `auto` are equivalent). Auto probes, in order, working `rewallpaper available`, Sway (`SWAYSOCK` nonempty plus `swaymsg`), Hyprland (`HYPRLAND_INSTANCE_SIGNATURE` plus `hyprctl`), `swww`, then Wayland `swaybg` (`WAYLAND_DISPLAY` nonempty plus `swaybg`). If none is usable, reTheme warns clearly and skips.
 
-- `rewallpaper` (default): checks `rewallpaper available`, then runs `rewallpaper apply <path>`
-- `sway`: `swaymsg output '*' bg <path> fill`
-- `hyprpaper`: `hyprctl hyprpaper wallpaper ,<path>,cover`
-- `swww`: `swww img <path>` for wlroots sessions
-- `none`: do not invoke a backend
-
-Backend failures warn and do not block state publication. reTheme uses no dependencies, does not invoke NixOS hooks or shell commands, and has no macOS runtime support.
+Explicit backends are `rewallpaper`, `sway`, `hyprpaper`, `swww`, `swaybg`, and `none`; they retain their direct commands. The final Wayland fallback runs `swaybg -i <path> -m fill`. Its owned PID and Linux `/proc` start-time identity are stored in `active/wallpaper.pid`; replacement stops only a tracked, still-matching `swaybg`, so stale or reused PIDs are never signaled. Active transactions preserve this state. Backend failures warn and do not block state publication. reTheme uses no dependencies, does not invoke NixOS hooks or shell commands, and has no macOS runtime support.
